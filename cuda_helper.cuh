@@ -126,6 +126,15 @@ template<typename T> inline void printMat(T* A, int height, int width, std::stri
     }
 }
 
+template<typename T> inline bool areEqual(T* A, T* B, int height, int width) {
+    for (int i = 0; i < height * width; i++) {
+        if (A[i] != B[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
 /** CPU Wall timer
  */
 struct TimerCPU {
