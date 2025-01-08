@@ -129,6 +129,8 @@ template<typename T> inline void printMat(T* A, int height, int width, std::stri
 template<typename T> inline bool areEqual(T* A, T* B, int height, int width) {
     for (int i = 0; i < height * width; i++) {
         if (A[i] != B[i]) {
+            std::cout << "difference at " << i << "\r\n";
+            std::cout << "A:" << __half2float(A[i]) <<" B:" << __half2float(B[i]) << "\r\n";
             return false;
         }
     }
