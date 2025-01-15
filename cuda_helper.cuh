@@ -6,6 +6,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <chrono>
+#include "mma.h";
 #include <iomanip>
 
 #ifndef CUDA_DISABLE_ERROR_CHECKING
@@ -135,6 +136,48 @@ template<typename T> inline bool areEqual(T* A, T* B, int height, int width) {
         }
     }
     return true;
+}
+
+template<typename T> inline long double totalDifference(T* A, T* B, int height, int width) {
+    long double difference = 0.0f;
+    for (int i = 0; i < height * width; i++) {
+        float diff = static_cast<float>(A[i]) - static_cast<float>(B[i]);
+        if (diff < 0.0f) {
+            difference -= static_cast<long double>(diff);
+        }
+        else {
+            difference += static_cast<long double>(diff);
+        }
+    }
+    return difference;
+}
+
+inline long double totalDifference(double* A, half* B, int height, int width) {
+    long double difference = 0.0f;
+    for (int i = 0; i < height * width; i++) {
+        double diff = A[i] - static_cast<double>(B[i]);
+        if (diff < 0.0f) {
+            difference -= static_cast<long double>(diff);
+        }
+        else {
+            difference += static_cast<long double>(diff);
+        }
+    }
+    return difference;
+}
+
+inline long double totalDifference(float* A, half* B, int height, int width) {
+    long double difference = 0.0f;
+    for (int i = 0; i < height * width; i++) {
+        float diff = A[i] - static_cast<float>(B[i]);
+        if (diff < 0.0f) {
+            difference -= static_cast<long double>(diff);
+        }
+        else {
+            difference += static_cast<long double>(diff);
+        }
+    }
+    return difference;
 }
 
 /** CPU Wall timer
