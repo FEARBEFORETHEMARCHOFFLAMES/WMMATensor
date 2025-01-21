@@ -10,12 +10,17 @@
 #include <fstream>
 
 constexpr int TILE_SIZE = 16;
+constexpr int WARP_SIZE = 32;
 
 // WMMA guide/article: https://developer.nvidia.com/blog/programming-tensor-cores-cuda-9/#programmatic_access_to_tensor_cores_in_cuda_90
 // Nvidia programming guide: https://docs.nvidia.com/cuda/cuda-c-programming-guide/#warp-matrix-functions
 // Float precision: https://blog.demofox.org/2017/11/21/floating-point-precision/
 // Double precision in tensors: https://blogs.nvidia.com/blog/double-precision-tensor-cores/ -> in hpc alpha?
 // Which fragment sizes are supported?: https://forums.developer.nvidia.com/t/why-does-wmma-and-mma-support-different-matrix-tile-size/271067 -> https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#warp-level-matrix-instructions-wmma-mma
+// Blocks are only launched if all of it's warps can be resident: https://stackoverflow.com/questions/6605581/what-is-the-context-switching-mechanism-in-gpu
+// Number of blocks and threads per block should constitute a "full load", i.e. maximum resident threads, to yield good occupancy: https://forums.developer.nvidia.com/t/question-about-threads-per-block-and-warps-per-sm/77491
+// Very good explanation of warp and block scheduling: https://stackoverflow.com/questions/64624793/warp-and-block-scheduling-in-cuda-what-exactly-happens-and-questions-about-el
+// Choosing number of blocks and threads: https://forums.developer.nvidia.com/t/how-to-choose-how-many-threads-blocks-to-have/55529
 template<typename T> __global__ void matmuladd_simple(T const* const a, T const* const b, T* const c, 
     const int N, const int K, const int M) {
     for (int row = threadIdx.y + blockIdx.y * blockDim.y;
@@ -51,91 +56,13 @@ template<typename T> __global__ void wmma_kernel(T* a, T* b, T* c, T* a_temp, T*
     for (int row = 0; row < N; row += TILE_SIZE) {
         for (int col = 0; col < M; col += TILE_SIZE) {
             fill_fragment(c_frag, 0.0f);
-
             for (int k = 0; k < K; k += TILE_SIZE) {
-                if (TILE_SIZE > N - row  // tile size is greater than remaining rows in A
-                 || TILE_SIZE > K - k    // tile size is greater than remaining cols in A / remaining rows in B
-                 || TILE_SIZE > M - col) { // tile size is greater than remaining cols in B
-                //    /*for (int rowLeftover = row + threadIdx.y + blockIdx.y * blockDim.y;
-                //        rowLeftover < N;
-                //        rowLeftover += blockDim.y * gridDim.y) {
-
-                //        for (int colLeftover = col + threadIdx.x + blockIdx.x * blockDim.x;
-                //            colLeftover < M;
-                //            colLeftover += blockDim.x * gridDim.x) {
-                //            T result = 0;
-
-                //            for (int kLeftover = k; kLeftover < K; kLeftover++) {
-                //                result += a[rowLeftover * K + kLeftover] * b[kLeftover * M + colLeftover];
-                //            }
-                //            c[rowLeftover * M + colLeftover] += result;
-                //        }
-                //    }*/
-                    auto lane_id = threadIdx.x % 32;
-                    // we want to populate the a_temp and b_temp vector with data from a/b AND padded zeros
-                    for (int i = 0; i < 8; i++) {
-                        int targetRow = row + lane_id / 16 + 2 * i;
-                        int targetColumn = k + lane_id % 16;
-                        if (targetRow < N && targetColumn < K) {
-                            a_temp[(lane_id/16 + 2 * i) * 16 + lane_id % 16] = a[targetRow * K + targetColumn];
-                        }
-                        else {
-                            a_temp[(lane_id / 16 + 2 * i) * 16 + lane_id % 16] = 0;
-                        }
-
-                        targetRow = k + lane_id / 16 + 2 * i;
-                        targetColumn = col + lane_id % 16;
-                        if (targetRow < K && targetColumn < M) {
-                            b_temp[i * 32 + lane_id] = b[targetRow * M + targetColumn];
-                        }
-                        else {
-                            b_temp[i * 32 + lane_id] = 0;
-                        }
-                    }
-
-
-                    if (threadIdx.x == 0 && blockIdx.x == 0 && !printedOnce) {
-                        printf("a:\r\n[");
-                        for (int y = 0; y < 16; y++) {
-                            for (int x = 0; x < 16; x++) {
-                                printf("%f ", __half2float(a_temp[y * 16 + x]));
-                            }
-                            if (y == 15) {
-                                printf("]\r\n");
-                            }
-                            else {
-                                printf("\r\n ");
-                            }
-                        }
-                        printf("b:\r\n[");
-                        for (int y = 0; y < 16; y++) {
-                            for (int x = 0; x < 16; x++) {
-                                printf("%f ", __half2float(b_temp[y * 16 + x]));
-                            }
-                            if (y == 15) {
-                                printf("]\r\n");
-                            }
-                            else {
-                                printf("\r\n ");
-                            }
-                        }
-                        printedOnce = true;
-                    }
-                    __syncwarp();
-                    load_matrix_sync(a_frag, a_temp, 0);
-                    load_matrix_sync(b_frag, b_temp, 0);
-                    mma_sync(c_frag, a_frag, b_frag, c_frag);
-                }
-                else {
                     // The last argument is the stride between consecutive rows -> i.e. we load 16 elements from the first row, how many elements to skip to get to the next row?
                     // -> amount of columns, K for a and N for b
                     // We have to start the load at a 256bit aligned position (16x16=256), do pointer arithmetic to figure out start of tile
                     load_matrix_sync(a_frag, &a[row * K + k], K);
                     load_matrix_sync(b_frag, &b[k * M + col], M);
                     mma_sync(c_frag, a_frag, b_frag, c_frag);
-
-                    // Continuously sum up tiles
-                }
             }
             // store result of tile sum(c_frag) in the corresponding c tile. N is again the number of columns(stride between rows of the tile)
             store_matrix_sync(&c[row * M + col], c_frag, M, mem_row_major);
@@ -143,7 +70,35 @@ template<typename T> __global__ void wmma_kernel(T* a, T* b, T* c, T* a_temp, T*
     }
 }
 
-template<typename T> void runMatmulSimple(T* h_a, T* h_b, T* h_c, T* result, const int N, const int K, const int M, const int threadsPerSM, const int blocks) {
+template<typename T> __global__ void wmmaGridStride(T* a, T* b, T* c, T* a_temp, T* b_temp, const int N, const int K, const int M) {
+    int threadId = threadIdx.x + blockIdx.x * blockDim.x;
+    int warpId = threadId / WARP_SIZE;
+    int tileIdX = warpId % (M / TILE_SIZE);
+    int tileIdY = warpId / (M / TILE_SIZE);
+
+    /*if (tileIdY >= N) {
+        printf("Error, tileIdY was greater than N");
+        return;
+    }
+    printf("(%d, %d)", tileIdX, tileIdY);*/
+    fragment<matrix_a, TILE_SIZE, TILE_SIZE, TILE_SIZE, T, row_major> a_frag;
+    fragment<matrix_b, TILE_SIZE, TILE_SIZE, TILE_SIZE, T, row_major> b_frag;
+    fragment<accumulator, TILE_SIZE, TILE_SIZE, TILE_SIZE, T> c_frag;
+    bool printedOnce = false;
+    fill_fragment(c_frag, 0.0f);
+    for (int k = 0; k < K; k += TILE_SIZE) {
+        // The last argument is the stride between consecutive rows -> i.e. we load 16 elements from the first row, how many elements to skip to get to the next row?
+        // -> amount of columns, K for a and N for b
+        // We have to start the load at a 256bit aligned position (16x16=256), do pointer arithmetic to figure out start of tile
+        load_matrix_sync(a_frag, &a[tileIdY * TILE_SIZE * K + k], K);
+        load_matrix_sync(b_frag, &b[k * M + tileIdX * TILE_SIZE], M);
+        mma_sync(c_frag, a_frag, b_frag, c_frag);
+    }
+    // store result of tile sum(c_frag) in the corresponding c tile. N is again the number of columns(stride between rows of the tile)
+    store_matrix_sync(&c[tileIdY * TILE_SIZE * M + tileIdX * TILE_SIZE], c_frag, M, mem_row_major);
+}
+
+template<typename T> void runMatmulSimple(T* h_a, T* h_b, T* h_c, T* result, const int N, const int K, const int M, const int threadsPerBlock, const int blocks) {
     T* h_d = new T[N * M];
     T* d_a, * d_b, * d_c;
     CHECK_CUDA(cudaMalloc(&d_a, N * K * sizeof(T)));
@@ -154,16 +109,16 @@ template<typename T> void runMatmulSimple(T* h_a, T* h_b, T* h_c, T* result, con
     CHECK_CUDA(cudaMemcpy(d_b, h_b, K * M * sizeof(T), cudaMemcpyHostToDevice));
     CHECK_CUDA(cudaMemcpy(d_c, h_c, N * M * sizeof(T), cudaMemcpyHostToDevice));
 
-    dim3 threadsPerBlock(threadsPerSM);
-    dim3 blocksPerGrid(blocks);
+    dim3 threadsPerBlock3D(threadsPerBlock);
+    dim3 blocksPerGrid3D(blocks);
 
-    matmuladd_simple<T><<<blocksPerGrid, threadsPerBlock>>>(d_a, d_b, d_c, N, K, M);
+    matmuladd_simple<T><<<blocksPerGrid3D, threadsPerBlock3D>>>(d_a, d_b, d_c, N, K, M);
 
     CHECK_CUDA(cudaMemcpy(result, d_c, N * M * sizeof(T), cudaMemcpyDeviceToHost));
     CHECK_CUDA(cudaDeviceSynchronize());
 }
 
-template<typename T> void runWMMA(T* h_a, T* h_b, T* h_c, T* result, const int N, const int K, const int M, const int threadsPerSM, const int blocks) {
+template<typename T> void runWMMA(T* h_a, T* h_b, T* h_c, T* result, const int N, const int K, const int M, const int threadsPerBlock, const int blocks) {
     T* h_d = new T[N * M];
     T* d_a, * d_b, * d_c;
     T* d_a_temp, *d_b_temp;
@@ -178,10 +133,34 @@ template<typename T> void runWMMA(T* h_a, T* h_b, T* h_c, T* result, const int N
     CHECK_CUDA(cudaMemcpy(d_b, h_b, K * M * sizeof(T), cudaMemcpyHostToDevice));
     CHECK_CUDA(cudaMemcpy(d_c, h_c, N * M * sizeof(T), cudaMemcpyHostToDevice));
 
-    dim3 threadsPerBlock(threadsPerSM);
-    dim3 blocksPerGrid(blocks);
+    dim3 threadsPerBlock3D(threadsPerBlock);
+    dim3 blocksPerGrid3D(blocks);
 
-    wmma_kernel<T><<<blocksPerGrid, threadsPerBlock>>>(d_a, d_b, d_c, d_a_temp, d_b_temp, N, K, M);
+    wmma_kernel<T><<<blocksPerGrid3D, threadsPerBlock3D>>>(d_a, d_b, d_c, d_a_temp, d_b_temp, N, K, M);
+
+    CHECK_CUDA(cudaMemcpy(result, d_c, N * M * sizeof(T), cudaMemcpyDeviceToHost));
+    CHECK_CUDA(cudaDeviceSynchronize());
+}
+
+template<typename T> void runWMMAGridStride(T* h_a, T* h_b, T* h_c, T* result, const int N, const int K, const int M, const int threadsPerBlock, const int blocks) {
+    T* h_d = new T[N * M];
+    T* d_a, * d_b, * d_c;
+    T* d_a_temp, * d_b_temp;
+    CHECK_CUDA(cudaMalloc(&d_a, N * K * sizeof(T)));
+    CHECK_CUDA(cudaMalloc(&d_b, K * M * sizeof(T)));
+    CHECK_CUDA(cudaMalloc(&d_c, N * M * sizeof(T)));
+
+    CHECK_CUDA(cudaMalloc(&d_a_temp, TILE_SIZE * TILE_SIZE * sizeof(T)));
+    CHECK_CUDA(cudaMalloc(&d_b_temp, TILE_SIZE * TILE_SIZE * sizeof(T)));
+
+    CHECK_CUDA(cudaMemcpy(d_a, h_a, N * K * sizeof(T), cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_b, h_b, K * M * sizeof(T), cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_c, h_c, N * M * sizeof(T), cudaMemcpyHostToDevice));
+
+    dim3 threadsPerBlock3D(threadsPerBlock);
+    dim3 blocksPerGrid3D(blocks);
+
+    wmmaGridStride<T> << <blocksPerGrid3D, threadsPerBlock3D>> > (d_a, d_b, d_c, d_a_temp, d_b_temp, N, K, M);
 
     CHECK_CUDA(cudaMemcpy(result, d_c, N * M * sizeof(T), cudaMemcpyDeviceToHost));
     CHECK_CUDA(cudaDeviceSynchronize());
@@ -259,9 +238,12 @@ int main()
 {
     const int dev = 0;
     std::cout << getCUDADeviceInformations(dev).str() << "\n\n";
-    int M = 1025, K = 1025, N = 1025;
-    int threadsPerSM = 256;
-    int blocks = 2;
+    int M = 2048, K = 2048, N = 2048;
+    // the number of threads should be 32 * (N/16) * (M/16)
+    // adjust blocks such that this holds
+    int totalThreads = 32 * (N / 16) * (M / 16);
+    int threadsPerBlock = 128;
+    int blocks = totalThreads / threadsPerBlock;
     
     half* h_a = new half[N * K]; // N hoch, K breit
     float* h_a_2 = new float[N * K]; // N hoch, K breit
@@ -285,29 +267,47 @@ int main()
         h_b_2[i] = (float)randomNumber / divisor_double;
     }
 
-    std::cout << "h_a: [ ";
+    /*std::cout << "h_a: [ ";
     for (int i = 0; i < N; i++) {
         std::cout << __half2float(h_a[i * N + K - 1]) << " ";
-    }
-    std::cout << "]\r\n";
+    }*/
+    //std::cout << "]\r\n";
 
-    std::cout << "h_b: [ ";
+    /*std::cout << "h_b: [ ";
     for (int i = 0; i < N; i++) {
         std::cout << __half2float(h_b[(K-1) * M + i]) << " ";
     }
-    std::cout << "]\r\n";
+    std::cout << "]\r\n";*/
     for (size_t i = 0; i < N * M; i++) {
         //It is not possible to load things directly into c in wmma!
         h_c[i] = 0.0f;
         h_c_2[i] = 0.0f;
     }
     half* result1 = new half[N * M];
-    runWMMA<half>(h_a, h_b, h_c, result1, N, K, M, threadsPerSM, blocks);
-    float* result2 = new float[N * M];
-    runMatmulSimple<float>(h_a_2, h_b_2, h_c_2, result2, N, K, M, threadsPerSM, blocks);
+    TimerCPU timerCPU;
+    timerCPU.startTimer();
+    runWMMA<half>(h_a, h_b, h_c, result1, N, K, M, 256, 2);
+    std::cout << "WMMA kernel before took " << timerCPU.stopTimer() << " milliseconds\r\n";
 
-    long double totalDiff = totalDifference(result2, result1, N, M);
-    std::cout << "Total difference between simple cuda float and WMMA result: " << totalDiff << std::endl;
-    std::cout << "Average difference between regular and WMMA result: " << totalDiff / (long double)(N * M) << std::endl;
+    half* result2 = new half[N * M];
+    TimerCPU timerCPU2;
+    timerCPU2.startTimer();
+    runWMMAGridStride<half>(h_a, h_b, h_c, result2, N, K, M, threadsPerBlock, blocks);
+    std::cout << "WMMA kernel after took " << timerCPU2.stopTimer() << " milliseconds\r\n";
+
+   // printMat(result2, N, M, "result2");
+
+    float* result3 = new float[N * M];
+    TimerCPU timerCPU3;
+    timerCPU3.startTimer();
+    runMatmulSimple<float>(h_a_2, h_b_2, h_c_2, result3, N, K, M, threadsPerBlock, blocks);
+    std::cout << "Matmul Simple took " << timerCPU3.stopTimer() << " milliseconds\r\n";
+
+    long double totalDiff = totalDifference(result3, result1, N, M);
+    long double totalDiff2 = totalDifference(result3, result2, N, M);
+    std::cout << "Total difference between simple cuda float and first WMMA result: " << totalDiff << std::endl;
+    std::cout << "Total difference between simple cuda float and second WMMA result: " << totalDiff2 << std::endl;
+    std::cout << "Average difference between regular and first WMMA result: " << totalDiff / (long double)(N * M) << std::endl;
+    std::cout << "Average difference between regular and second WMMA result: " << totalDiff2 / (long double)(N * M) << std::endl;
     return 0;
 }
