@@ -48,29 +48,7 @@ using namespace nvcuda::wmma;
 // => basically, it works just like the element wise multiplication. Except that every element is replaced with a 16x16 tile!#
 // If the input matrices do not fit the tiling neatly, we will have to manually calculate the remainder matrix parts
 // -> this is probably
-template<typename T> __global__ void wmma_kernel(T* a, T* b, T* c, T* a_temp, T* b_temp, const int N, const int K, const int M) {
-    fragment<matrix_a, TILE_SIZE, TILE_SIZE, TILE_SIZE, T, row_major> a_frag;
-    fragment<matrix_b, TILE_SIZE, TILE_SIZE, TILE_SIZE, T, row_major> b_frag;
-    fragment<accumulator, TILE_SIZE, TILE_SIZE, TILE_SIZE, T> c_frag;
-    bool printedOnce = false;
-    for (int row = 0; row < N; row += TILE_SIZE) {
-        for (int col = 0; col < M; col += TILE_SIZE) {
-            fill_fragment(c_frag, 0.0f);
-            for (int k = 0; k < K; k += TILE_SIZE) {
-                    // The last argument is the stride between consecutive rows -> i.e. we load 16 elements from the first row, how many elements to skip to get to the next row?
-                    // -> amount of columns, K for a and N for b
-                    // We have to start the load at a 256bit aligned position (16x16=256), do pointer arithmetic to figure out start of tile
-                    load_matrix_sync(a_frag, &a[row * K + k], K);
-                    load_matrix_sync(b_frag, &b[k * M + col], M);
-                    mma_sync(c_frag, a_frag, b_frag, c_frag);
-            }
-            // store result of tile sum(c_frag) in the corresponding c tile. N is again the number of columns(stride between rows of the tile)
-            store_matrix_sync(&c[row * M + col], c_frag, M, mem_row_major);
-        }
-    }
-}
-
-template<typename T> __global__ void wmmaGridStride(T* a, T* b, T* c, T* a_temp, T* b_temp, const int N, const int K, const int M) {
+template<typename T> __global__ void wmmaFixedAmountOfThreads(T* a, T* b, T* c, T* a_temp, T* b_temp, const int N, const int K, const int M) {
     int threadId = threadIdx.x + blockIdx.x * blockDim.x;
     int warpId = threadId / WARP_SIZE;
     int tileIdX = warpId % (M / TILE_SIZE);
@@ -98,6 +76,39 @@ template<typename T> __global__ void wmmaGridStride(T* a, T* b, T* c, T* a_temp,
     store_matrix_sync(&c[tileIdY * TILE_SIZE * M + tileIdX * TILE_SIZE], c_frag, M, mem_row_major);
 }
 
+template<typename T> __global__ void wmmaGridStride(T* a, T* b, T* c, T* a_temp, T* b_temp, const int N, const int K, const int M) {
+    int threadId = threadIdx.x + blockIdx.x * blockDim.x;
+    int warpId = threadId / WARP_SIZE;
+    int tileIdX = warpId % (M / TILE_SIZE);
+    int tileIdY = warpId / (M / TILE_SIZE);
+    bool firstIteration = true;
+    while(tileIdY < (N / TILE_SIZE)) {
+        /*if (threadIdx.x == 0 && blockIdx.x == 0) {
+            printf("%d, %d\r\n", tileIdX, tileIdY);
+        }*/
+        fragment<matrix_a, TILE_SIZE, TILE_SIZE, TILE_SIZE, T, row_major> a_frag;
+        fragment<matrix_b, TILE_SIZE, TILE_SIZE, TILE_SIZE, T, row_major> b_frag;
+        fragment<accumulator, TILE_SIZE, TILE_SIZE, TILE_SIZE, T> c_frag;
+        fill_fragment(c_frag, 0.0f);
+        for (int k = 0; k < K; k += TILE_SIZE) {
+            // The last argument is the stride between consecutive rows -> i.e. we load 16 elements from the first row, how many elements to skip to get to the next row?
+            // -> amount of columns, K for a and N for b
+            // We have to start the load at a 256bit aligned position (16x16=256), do pointer arithmetic to figure out start of tile
+            load_matrix_sync(a_frag, &a[tileIdY * TILE_SIZE * K + k], K);
+            load_matrix_sync(b_frag, &b[k * M + tileIdX * TILE_SIZE], M);
+            mma_sync(c_frag, a_frag, b_frag, c_frag);
+        }
+        // store result of tile sum(c_frag) in the corresponding c tile. N is again the number of columns(stride between rows of the tile)
+        store_matrix_sync(&c[tileIdY * TILE_SIZE * M + tileIdX * TILE_SIZE], c_frag, M, mem_row_major);
+        
+        firstIteration = false;
+        threadId += blockDim.x * gridDim.x;
+        warpId = threadId / WARP_SIZE;
+        tileIdX = warpId % (M / TILE_SIZE);
+        tileIdY = warpId / (M / TILE_SIZE);
+    }
+}
+
 template<typename T> void runMatmulSimple(T* h_a, T* h_b, T* h_c, T* result, const int N, const int K, const int M, const int threadsPerBlock, const int blocks) {
     T* h_d = new T[N * M];
     T* d_a, * d_b, * d_c;
@@ -118,7 +129,7 @@ template<typename T> void runMatmulSimple(T* h_a, T* h_b, T* h_c, T* result, con
     CHECK_CUDA(cudaDeviceSynchronize());
 }
 
-template<typename T> void runWMMA(T* h_a, T* h_b, T* h_c, T* result, const int N, const int K, const int M, const int threadsPerBlock, const int blocks) {
+template<typename T> void runWMMAFixedAmountOfThreads(T* h_a, T* h_b, T* h_c, T* result, const int N, const int K, const int M, const int threadsPerBlock, const int blocks) {
     T* h_d = new T[N * M];
     T* d_a, * d_b, * d_c;
     T* d_a_temp, *d_b_temp;
@@ -136,7 +147,7 @@ template<typename T> void runWMMA(T* h_a, T* h_b, T* h_c, T* result, const int N
     dim3 threadsPerBlock3D(threadsPerBlock);
     dim3 blocksPerGrid3D(blocks);
 
-    wmma_kernel<T><<<blocksPerGrid3D, threadsPerBlock3D>>>(d_a, d_b, d_c, d_a_temp, d_b_temp, N, K, M);
+    wmmaFixedAmountOfThreads<T><<<blocksPerGrid3D, threadsPerBlock3D>>>(d_a, d_b, d_c, d_a_temp, d_b_temp, N, K, M);
 
     CHECK_CUDA(cudaMemcpy(result, d_c, N * M * sizeof(T), cudaMemcpyDeviceToHost));
     CHECK_CUDA(cudaDeviceSynchronize());
@@ -210,7 +221,7 @@ void createTestFile() {
             }
             std::cout << "Done with generating data" << std::endl;
             half* result1 = new half[N * M];
-            runWMMA<half>(h_a, h_b, h_c, result1, N, K, M, threadsPerSM, blocks);
+            runWMMAFixedAmountOfThreads<half>(h_a, h_b, h_c, result1, N, K, M, threadsPerSM, blocks);
             std::cout << "Done with half simple" << std::endl;
             double* result2 = new double[N * M];
             runMatmulSimple<double>(h_a_2, h_b_2, h_c_2, result2, N, K, M, threadsPerSM, blocks);
@@ -238,7 +249,7 @@ int main()
 {
     const int dev = 0;
     std::cout << getCUDADeviceInformations(dev).str() << "\n\n";
-    int M = 2048, K = 2048, N = 2048;
+    int M = 1024, K = 1024, N = 1024;
     // the number of threads should be 32 * (N/16) * (M/16)
     // adjust blocks such that this holds
     int totalThreads = 32 * (N / 16) * (M / 16);
@@ -261,7 +272,7 @@ int main()
         h_a_2[i] = (float)randomNumber / divisor_double;
     }
 
-    for (size_t i = 0; i < K * M; i++) {
+    for (size_t i = 0; i < K * M; i++) {    
         int randomNumber = std::rand();
         h_b[i] = (half)randomNumber / divisor_half;
         h_b_2[i] = (float)randomNumber / divisor_double;
@@ -286,13 +297,13 @@ int main()
     half* result1 = new half[N * M];
     TimerCPU timerCPU;
     timerCPU.startTimer();
-    runWMMA<half>(h_a, h_b, h_c, result1, N, K, M, 256, 2);
+    runWMMAFixedAmountOfThreads<half>(h_a, h_b, h_c, result1, N, K, M, threadsPerBlock, blocks);
     std::cout << "WMMA kernel before took " << timerCPU.stopTimer() << " milliseconds\r\n";
 
     half* result2 = new half[N * M];
     TimerCPU timerCPU2;
     timerCPU2.startTimer();
-    runWMMAGridStride<half>(h_a, h_b, h_c, result2, N, K, M, threadsPerBlock, blocks);
+    runWMMAGridStride<half>(h_a, h_b, h_c, result2, N, K, M, threadsPerBlock, blocks / 64);
     std::cout << "WMMA kernel after took " << timerCPU2.stopTimer() << " milliseconds\r\n";
 
    // printMat(result2, N, M, "result2");
