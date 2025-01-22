@@ -180,6 +180,44 @@ inline long double totalDifference(float* A, half* B, int height, int width) {
     return difference;
 }
 
+inline long double standardDeviation(double* A, half* B, int height, int width) {
+    double* differences = new double[height * width];
+    long double meanWithSign = 0.0f;
+    for (int i = 0; i < height * width; i++) {
+        double signedDifference = A[i] - static_cast<double>(B[i]);
+        meanWithSign += signedDifference;
+        differences[i] = signedDifference;
+    }
+    meanWithSign = meanWithSign / (height * width);
+    
+    long double variance = 0.0f;
+    for (int i = 0; i < height * width; i++) {
+        variance += std::pow(differences[i] - meanWithSign, 2);
+    }
+    variance = variance / (height * width);
+
+    return std::sqrt(variance);
+}
+
+inline long double standardDeviation(float* A, half* B, int height, int width) {
+    double* differences = new double[height * width];
+    long double meanWithSign = 0.0f;
+    for (int i = 0; i < height * width; i++) {
+        double signedDifference = A[i] - static_cast<float>(B[i]);
+        meanWithSign += signedDifference;
+        differences[i] = signedDifference;
+    }
+    meanWithSign = meanWithSign / (height * width);
+
+    long double variance = 0.0f;
+    for (int i = 0; i < height * width; i++) {
+        variance += std::pow(differences[i] - meanWithSign, 2);
+    }
+    variance = variance / (height * width);
+
+    return std::sqrt(variance);
+}
+
 /** CPU Wall timer
  */
 struct TimerCPU {
