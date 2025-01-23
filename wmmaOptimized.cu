@@ -294,8 +294,8 @@ void createTestFile() {
     int repetitions = 10;
     int N, K, M = 0;
     std::ofstream myfile;
-    half divisor = (half)(RAND_MAX + 1u) / (half)6.0f;
-    myfile.open("FloatSimple_vs_HalfSimple_0_6_StandardDeviation.csv");
+    half divisor = (half)(RAND_MAX + 1u)/* / (half)6.0f*/;
+    myfile.open("FloatSimple_vs_HalfWMMA_0_1_StandardDeviation.csv");
     for (int s = 0; s < 5; s++) {
         N = sizes[s];
         M = sizes[s];
@@ -333,7 +333,7 @@ void createTestFile() {
             }
             std::cout << "Done with generating data" << std::endl;
             half* result1 = new half[N * M];
-            runMatmulTiled<half>(h_a, h_b, h_c, result1, N, K, M, threadsPerBlock, blocks);
+            runWMMAGridStride<half>(h_a, h_b, h_c, result1, N, K, M, threadsPerBlock, blocks);
             std::cout << "Done with wmma grid stride" << std::endl;
             float* result2 = new float[N * M];
             runMatmulTiled<float>(h_a_2, h_b_2, h_c_2, result2, N, K, M, threadsPerBlock, blocks);
