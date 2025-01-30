@@ -8,6 +8,7 @@
 #include "device_launch_parameters.h"
 #include "mma.h";
 #include <fstream>
+#include "nvtx3/nvToolsExt.h"
 
 constexpr int TILE_SIZE = 16;
 constexpr int WARP_SIZE = 32;
@@ -24,6 +25,8 @@ constexpr int WARP_SIZE = 32;
 // Stride in load_matrix_sync must be a multiple of 8: https://docs.nvidia.com/cuda/cuda-c-programming-guide/#wmma-description
 // Accessing fragments directly offers no guarantee of element order: https://forums.developer.nvidia.com/t/how-does-the-operation-like-some-fragment-x-index-work-in-wmma-api/287291
 // Precision loss due to tensor cores: https://arxiv.org/pdf/1803.04014
+// "Pitched" i.e. padded memory on the gpu is initialized to zero in my tests, but i can not find any guarantees/documentation of it!! avoid accessing it for now
+
 
 // This function is from the TU Dresden Highly Parallel Programming of GPUs Lecture
 template<typename T> __global__ void matmuladd_simple(T const* const a, T const* const b, T* const c, 
@@ -36,7 +39,7 @@ template<typename T> __global__ void matmuladd_simple(T const* const a, T const*
             col < M;
             col += blockDim.x * gridDim.x) {
             T result = 0;
-
+            
             for (int k = 0; k < K; k++) {
                 result += a[row * K + k] * b[k * M + col];
             }
@@ -167,34 +170,138 @@ template<typename T> __global__ void wmmaGridStride(T* a, T* b, T* c, const int 
     }
 }
 
-template<typename T> void gridStridingFix(T* h_a, T* h_b, T* h_c, T* result, const int N, const int K, const int M) {
-    int leftoverRows = N - N % TILE_SIZE;
-    int leftoverColumns = M - M % TILE_SIZE;
-    for (int row = threadIdx.y + blockIdx.y * blockDim.y;
-        row < N;
-        row += blockDim.y * gridDim.y) {
 
-        for (int col = threadIdx.x + blockIdx.x * blockDim.x;
-            col < M;
-            col += blockDim.x * gridDim.x) {
-            T result = 0;
+// This function will only take care of the elements that fit neatly into 16x16 tiling.
+template<typename T> __global__ void wmmaGridStrideOnTileableArea(T* a, T* b, T* c, const int N, const int K, const int M, size_t pitch_a, size_t pitch_b, size_t pitch_c) {
+    int threadId = threadIdx.x + blockIdx.x * blockDim.x;
+    int warpId = threadId / WARP_SIZE;
+    int tileIdX = warpId % (M / TILE_SIZE);
+    int tileIdY = warpId / (M / TILE_SIZE);
+    while (tileIdY < (N / TILE_SIZE)) {
+        fragment<matrix_a, TILE_SIZE, TILE_SIZE, TILE_SIZE, T, row_major> a_frag;
+        fragment<matrix_b, TILE_SIZE, TILE_SIZE, TILE_SIZE, T, row_major> b_frag;
+        fragment<accumulator, TILE_SIZE, TILE_SIZE, TILE_SIZE, T> c_frag;
+        fill_fragment(c_frag, 0.0f);
 
-            int k = 0;
-            if (col >= M - M % TILE_SIZE && row >= N - N % TILE_SIZE) {
-                // We have not computed any part of the result yet
-                k = 0;
-            }
-            else {
-                // We have already computed the result partially
-                k = K - K % TILE_SIZE;
-            }
-            for (; k < K; k++) {
-                result += h_a[row * K + k] * h_b[k * M + col];
-            }
-            h_c[row * M + col] += result;
+        for (int k = 0; k < (K - K % TILE_SIZE); k += TILE_SIZE) {
+            load_matrix_sync(a_frag, ((T*)((char*)a + tileIdY * TILE_SIZE * pitch_a + k * sizeof(T))), pitch_a / sizeof(T));
+            load_matrix_sync(b_frag, ((T*)((char*)b + k * pitch_b + tileIdX * TILE_SIZE * sizeof(T))), pitch_b / sizeof(T));
+            mma_sync(c_frag, a_frag, b_frag, c_frag);
+
         }
+        store_matrix_sync((T*)((char*)c + tileIdY * TILE_SIZE * pitch_c + tileIdX * TILE_SIZE * sizeof(T)), c_frag, pitch_c / sizeof(T), mem_row_major);
+
+        threadId += blockDim.x * gridDim.x;
+        warpId = threadId / WARP_SIZE;
+        tileIdX = warpId % (M / TILE_SIZE);
+        tileIdY = warpId / (M / TILE_SIZE);
     }
 }
+
+
+template<typename T> __global__ void tilingFix(T* a, T* b, T* c, const int N, const int K, const int M, size_t pitch_a, size_t pitch_b, size_t pitch_c) {
+    // Phase 1: iterate over elements that have been taken care of during the tiling matrix matrix multiplication.
+    // -> these elements lack the values in the "leftover" parts of the matrix.
+    int leftoverRows = N - N % TILE_SIZE;
+    int leftoverColumns = M - M % TILE_SIZE;
+    int leftoverK = K - K % TILE_SIZE;
+    for (int id = threadIdx.x + blockIdx.x * blockDim.x; id < leftoverRows * leftoverColumns; id += blockDim.x * gridDim.x) {
+        int y = id / leftoverColumns;
+        int x = id % leftoverColumns;
+        T result = 0;
+        for (int k = leftoverK; k < K ; k++) {
+            result += *(T*)((char*)a + y * pitch_a + k * sizeof(T)) * *(T*)((char*)b + k * pitch_b + x * sizeof(T));
+        }
+        *(T*)((char*)c + y * pitch_c + x * sizeof(T)) += result;
+    }
+
+    // Phase 2: iteratee over elements that are in the leftover area
+    // each element has not been computed at all yet
+    // we have exactly one thread per element 
+    // 1. determine which element this thread is responsible for
+    int globalId = threadIdx.x + blockIdx.x * blockDim.x;
+    int x = 0;
+    int y = 0;
+    if (globalId < (M % TILE_SIZE) * (N % TILE_SIZE)) {
+        // we are in the range of IDs that should be assigned to one of the elements in the bottom right of the matrix
+        x = (M - M % TILE_SIZE) + globalId % (M % TILE_SIZE);
+        y = (N - N % TILE_SIZE) + globalId / (M % TILE_SIZE);
+    }
+    else if (globalId < (M % TILE_SIZE) * N) {
+        // should be assigned to one of the elements in the leftover columns
+        x = (M - M % TILE_SIZE) + (globalId - (M % TILE_SIZE) * (N % TILE_SIZE)) % (M % TILE_SIZE);
+        y = (globalId - (M % TILE_SIZE) * (N % TILE_SIZE)) / (M % TILE_SIZE);
+    }
+    else if (globalId < (M % TILE_SIZE) * N + (N % TILE_SIZE) * M) {
+        // should be assigned to one of the elemnts in the leftover rows
+        x = (globalId - (M % TILE_SIZE) * N) % (M - M % TILE_SIZE);
+        y = (N - N % TILE_SIZE) + (globalId - (M % TILE_SIZE) * N) / (M - M % TILE_SIZE);
+    }
+    else {
+        return;
+    }
+    T cResult = 0;
+    for (int k = 0; k < K; k++) {
+        T aValue = *(T*)((char*)a + y * pitch_a + k * sizeof(T));
+        T bValue = *(T*)((char*)b + k * pitch_b + x * sizeof(T));
+        cResult += aValue * bValue;
+    }
+    *(T*)((char*)c + y * pitch_c + x * sizeof(T)) = cResult;
+
+}
+
+template<typename T> __global__ void tilingFixMainMatrix(T* a, T* b, T* c, const int N, const int K, const int M, size_t pitch_a, size_t pitch_b, size_t pitch_c) {
+    // Phase 1: iterate over elements that have been taken care of during the tiling matrix matrix multiplication.
+    // -> these elements lack the values in the "leftover" parts of the matrix.
+    int leftoverRows = N - N % TILE_SIZE;
+    int leftoverColumns = M - M % TILE_SIZE;
+    int leftoverK = K - K % TILE_SIZE;
+    for (int id = threadIdx.x + blockIdx.x * blockDim.x; id < leftoverRows * leftoverColumns; id += blockDim.x * gridDim.x) {
+        int y = id / leftoverColumns;
+        int x = id % leftoverColumns;
+        T result = 0;
+        for (int k = leftoverK; k < K; k++) {
+            result += *(T*)((char*)a + y * pitch_a + k * sizeof(T)) * *(T*)((char*)b + k * pitch_b + x * sizeof(T));
+        }
+        *(T*)((char*)c + y * pitch_c + x * sizeof(T)) += result;
+    }
+}
+
+template<typename T> __global__ void tilingFixLeftovers(T* a, T* b, T* c, const int N, const int K, const int M, size_t pitch_a, size_t pitch_b, size_t pitch_c) {
+    // Phase 2: iteratee over elements that are in the leftover area
+    // each element has not been computed at all yet
+    // we have exactly one thread per element 
+    // 1. determine which element this thread is responsible for
+    int globalId = threadIdx.x + blockIdx.x * blockDim.x;
+    int x = 0;
+    int y = 0;
+    if (globalId < (M % TILE_SIZE) * (N % TILE_SIZE)) {
+        // we are in the range of IDs that should be assigned to one of the elements in the bottom right of the matrix
+        x = (M - M % TILE_SIZE) + globalId % (M % TILE_SIZE);
+        y = (N - N % TILE_SIZE) + globalId / (M % TILE_SIZE);
+    }
+    else if (globalId < (M % TILE_SIZE) * N) {
+        // should be assigned to one of the elements in the leftover columns
+        x = (M - M % TILE_SIZE) + (globalId - (M % TILE_SIZE) * (N % TILE_SIZE)) % (M % TILE_SIZE);
+        y = (globalId - (M % TILE_SIZE) * (N % TILE_SIZE)) / (M % TILE_SIZE);
+    }
+    else if (globalId < (M % TILE_SIZE) * N + (N % TILE_SIZE) * M) {
+        // should be assigned to one of the elemnts in the leftover rows
+        x = (globalId - (M % TILE_SIZE) * N) % (M - M % TILE_SIZE);
+        y = (N - N % TILE_SIZE) + (globalId - (M % TILE_SIZE) * N) / (M - M % TILE_SIZE);
+    }
+    else {
+        return;
+    }
+    T cResult = 0;
+    for (int k = 0; k < K; k++) {
+        T aValue = *(T*)((char*)a + y * pitch_a + k * sizeof(T));
+        T bValue = *(T*)((char*)b + k * pitch_b + x * sizeof(T));
+        cResult += aValue * bValue;
+    }
+    *(T*)((char*)c + y * pitch_c + x * sizeof(T)) = cResult;
+}
+
 
 template<typename T> void runMatmulSimple(T* h_a, T* h_b, T* h_c, T* result, const int N, const int K, const int M, const int threadsPerBlock, const int blocks) {
     T* h_d = new T[N * M];
@@ -279,10 +386,57 @@ template<typename T> void runWMMAGridStride(T* h_a, T* h_b, T* h_c, T* result, c
     dim3 threadsPerBlock3D(threadsPerBlock);
     dim3 blocksPerGrid3D(blocks);
 
+    nvtxRangePush("Pretiled");
     wmmaGridStride<T> << <blocksPerGrid3D, threadsPerBlock3D>> > (d_a, d_b, d_c, N, K, M);
+    nvtxRangePop();
 
     CHECK_CUDA(cudaMemcpy(result, d_c, N * M * sizeof(T), cudaMemcpyDeviceToHost));
     CHECK_CUDA(cudaDeviceSynchronize());
+}
+
+template<typename T> void runWMMATilingFix(T* h_a, T* h_b, T* h_c, T* result, const int N, const int K, const int M, const int threadsPerBlock, const int blocks) {
+    T* h_d = new T[N * M];
+    T* d_a, * d_b, * d_c;
+    size_t pitch_a, pitch_b, pitch_c;
+    CHECK_CUDA(cudaMallocPitch((void**)&d_a, &pitch_a, K * sizeof(T), N));
+    CHECK_CUDA(cudaMallocPitch((void**)&d_b, &pitch_b, M * sizeof(T), K));
+    CHECK_CUDA(cudaMallocPitch((void**)&d_c, &pitch_c, M * sizeof(T), N));
+
+    CHECK_CUDA(cudaMemcpy2D(d_a, pitch_a, h_a, K * sizeof(T), K * sizeof(T), N, cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy2D(d_b, pitch_b, h_b, M * sizeof(T), M * sizeof(T), K, cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy2D(d_c, pitch_c, h_c, M * sizeof(T), M * sizeof(T), N, cudaMemcpyHostToDevice));
+
+    dim3 threadsPerBlock3D(threadsPerBlock);
+    dim3 blocksPerGrid3D(blocks);
+    // Calculate threads for tilingFix. One thread per leftover element
+    // Idea: pass multiple of 32 as total number of threads. Some of these wont be used during phase 2, but can be useful for phase 1. Problem: thread divergence
+    int leftoverElements = (M % TILE_SIZE) * N + (N % TILE_SIZE) * M - (M % TILE_SIZE) * (N % TILE_SIZE);
+    dim3 threadsPerBLock3DTilingFixLeftovers(64);
+    dim3 blocksPerGrid3DTilingFixLeftovers(std::max(1, (int)std::ceil((double)leftoverElements / 64.0f)));
+
+    dim3 threadsPerBlock3DTilingFixMainMatrix(128);
+    dim3 blocksPerGrid3DTilingFixMainMatrix(std::max(1, (N - N % TILE_SIZE) * (M - M & TILE_SIZE) / 128));
+
+    int priorityLow, priorityHigh;
+    CHECK_CUDA(cudaDeviceGetStreamPriorityRange(&priorityLow, &priorityHigh));
+    cudaStream_t highPriorityStream, mediumPriorityStream, lowPriorityStream;
+    CHECK_CUDA(cudaStreamCreateWithPriority(&highPriorityStream, cudaStreamDefault, priorityHigh));
+    CHECK_CUDA(cudaStreamCreateWithPriority(&mediumPriorityStream, cudaStreamDefault, priorityLow + 1));
+    CHECK_CUDA(cudaStreamCreateWithPriority(&lowPriorityStream, cudaStreamDefault, priorityLow));
+
+    nvtxRangePush("TileableFix");
+    // Kernel launches
+    wmmaGridStrideOnTileableArea<T> << <blocksPerGrid3D, threadsPerBlock3D, 0, highPriorityStream>> > (d_a, d_b, d_c, N, K, M, pitch_a, pitch_b, pitch_c);
+    tilingFix<T> << <blocksPerGrid3DTilingFixLeftovers, threadsPerBLock3DTilingFixLeftovers, 0, lowPriorityStream >> > (d_a, d_b, d_c, N, K, M, pitch_a, pitch_b, pitch_c);
+    //tilingFixLeftovers<T> << < blocksPerGrid3DTilingFixLeftovers, threadsPerBLock3DTilingFixLeftovers, 0, mediumPriorityStream >> > (d_a, d_b, d_c, N, K, M, pitch_a, pitch_b, pitch_c);
+    //tilingFixMainMatrix<T> << < blocksPerGrid3DTilingFixMainMatrix, threadsPerBlock3DTilingFixMainMatrix, 0, lowPriorityStream >> > (d_a, d_b, d_c, N, K, M, pitch_a, pitch_b, pitch_c);
+    nvtxRangePop();
+
+    CHECK_CUDA(cudaMemcpy2D(result, M * sizeof(T), d_c, pitch_c, M * sizeof(T), N, cudaMemcpyDeviceToHost));
+    CHECK_CUDA(cudaStreamSynchronize(highPriorityStream));
+    CHECK_CUDA(cudaStreamSynchronize(lowPriorityStream));
+    CHECK_CUDA(cudaStreamDestroy(highPriorityStream));
+    CHECK_CUDA(cudaStreamDestroy(lowPriorityStream));
 }
 
 void createTestFile() {
@@ -364,7 +518,7 @@ void quickDevelopmentData() {
     const int dev = 0;
     std::cout << getCUDADeviceInformations(dev).str() << "\n\n";
     std::srand(1337);
-    int M = 1024, K = 1024, N = 1024;
+    int M = 1000, K = 500, N = 1000;
     int tileableM = M + (TILE_SIZE - M % TILE_SIZE);
     int tileableK = K + (TILE_SIZE - K % TILE_SIZE);
     int tileableN = N + (TILE_SIZE - N % TILE_SIZE);
@@ -449,12 +603,13 @@ void quickDevelopmentData() {
     }
 
     std::cout << "Generated b \r\n";
+    //printMat(host_a_half, N, M, "Input");
 
-    half* result1 = new half[N * M];
-    TimerCPU timerCPU;
-    timerCPU.startTimer();
-    runWMMAFixedAmountOfThreads<half>(host_a_half, host_b_half, host_c_half, result1, N, K, M, threadsPerBlock, blocks);
-    std::cout << "WMMA fixed amount of threads kernel took " << timerCPU.stopTimer() << " milliseconds\r\n";
+    //half* result1 = new half[N * M];
+    //TimerCPU timerCPU;
+    //timerCPU.startTimer();
+    //runWMMAFixedAmountOfThreads<half>(host_a_half, host_b_half, host_c_half, result1, N, K, M, threadsPerBlock, blocks);
+    //std::cout << "WMMA fixed amount of threads kernel took " << timerCPU.stopTimer() << " milliseconds\r\n";
     //printMat(result1, N, M, "FixedThreadsResult");
 
     half* result2 = new half[N * M];
@@ -468,13 +623,14 @@ void quickDevelopmentData() {
             result2[y * M + x] = result2WithZeros[y * tileableM + x];
         }
     }
-    //printMat(result2, N, M, "GridStrideResult");
+    //printMat(result2, N, M, "WWMA Grid Stride Result");
 
     float* result3 = new float[N * M];
     TimerCPU timerCPU3;
     timerCPU3.startTimer();
-    runMatmulTiled<float>(host_a_float, host_b_float, host_c_float, result3, N, K, M, threadsPerBlock, blocks);
+    runMatmulSimple<float>(host_a_float, host_b_float, host_c_float, result3, N, K, M, threadsPerBlock, blocks);
     std::cout << "Matmul Tiled took " << timerCPU3.stopTimer() << " milliseconds\r\n";
+    //printMat(result3, N, M, "CudaMatmulSimpleResult");
 
     /*float* result4 = new float[N * M];
     TimerCPU timerCPU4;
@@ -483,8 +639,15 @@ void quickDevelopmentData() {
     std::cout << "Matmul Simple took " << timerCPU4.stopTimer() << " milliseconds\r\n";*/
     //printMat(result4, N, M, "RegularResult");
 
-    long double totalDiff = totalDifference(result3, result1, N, M);
-    long double totalDiff2 = totalDifference(result3, result2, N, M);
+    half* result5 = new half[N * M];
+    TimerCPU timerCPU5;
+    timerCPU5.startTimer();
+    runWMMATilingFix<half>(host_a_half, host_b_half, host_c_half, result5, N, K, M, threadsPerBlock, blocks);
+    std::cout << "Matmul WMMA tiling fix took " << timerCPU5.stopTimer() << " milliseconds\r\n";
+    //printMat(result5, N, M, "WMMA Tiling fix Result");
+
+    long double totalDiff = totalDifference(result3, result2, N, M);
+    long double totalDiff2 = totalDifference(result3, result5, N, M);
     //long double totalDiff2 = totalDifference(result4, result2, N, M);
     std::cout << "Total difference between tiled cuda float and first WMMA result: " << totalDiff << std::endl;
     std::cout << "Total difference between tiled cuda float and second WMMA result: " << totalDiff2 << std::endl;
@@ -496,7 +659,7 @@ void quickDevelopmentData() {
 void nsightComputeRun() {
     const int dev = 0;
     std::cout << getCUDADeviceInformations(dev).str() << "\n\n";
-    int M = 1024, K = 1024, N = 1024;
+    int M = 1039, K = 1039, N = 1039;
     int tileableM = M + (TILE_SIZE - M % TILE_SIZE);
     int tileableK = K + (TILE_SIZE - K % TILE_SIZE);
     int tileableN = N + (TILE_SIZE - N % TILE_SIZE);
@@ -580,7 +743,7 @@ void nsightComputeRun() {
 
 
     half* result1 = new half[N * M];
-    runWMMAFixedAmountOfThreads<half>(host_a_half, host_b_half, host_c_half, result1, N, K, M, threadsPerBlock, blocks);
+    runWMMATilingFix<half>(host_a_half, host_b_half, host_c_half, result1, N, K, M, threadsPerBlock, blocks);
 
     half* result2WithZeros = new half[tileableN * tileableM];
     runWMMAGridStride<half>(host_a_half_tileable, host_b_half_tileable, host_c_half_tileable, result2WithZeros, tileableN, tileableK, tileableM, threadsPerBlock, blocks);
@@ -591,6 +754,6 @@ void nsightComputeRun() {
 
 int main()
 {
-    createTestFile();
+    nsightComputeRun();
     return 0;
 }
