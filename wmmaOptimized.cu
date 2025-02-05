@@ -26,7 +26,9 @@ constexpr int WARP_SIZE = 32;
 // Accessing fragments directly offers no guarantee of element order: https://forums.developer.nvidia.com/t/how-does-the-operation-like-some-fragment-x-index-work-in-wmma-api/287291
 // Precision loss due to tensor cores: https://arxiv.org/pdf/1803.04014
 // "Pitched" i.e. padded memory on the gpu is initialized to zero in my tests, but i can not find any guarantees/documentation of it!! avoid accessing it for now
+// at least 96kb of shared mem(per SM) on consumer grade GPUs https://images.nvidia.com/aem-dam/en-zz/Solutions/design-visualization/technologies/turing-architecture/NVIDIA-Turing-Architecture-Whitepaper.pdf
 
+//--------------------------------------------------- Kernels ------------------------------------------------------------------------
 
 // This function is from the TU Dresden Highly Parallel Programming of GPUs Lecture
 template<typename T> __global__ void matmuladd_simple(T const* const a, T const* const b, T* const c, 
@@ -109,12 +111,6 @@ __global__ void matmul_tiled(T* const c,
 }
 
 using namespace nvcuda::wmma;
-//Perform tiled matrix matrix multiplication
-//WMMA works on tile sizes of 16
-//We divide the matrix into equal sized tiles of 16
-//An output tile in the matrix c is the result of C_ij = Sum over k(A_ik * B_kj)
-// => basically, it works just like the element wise multiplication. Except that every element is replaced with a 16x16 tile!#
-// If the input matrices do not fit the tiling neatly, we will have to manually calculate the remainder matrix parts
 
 // This function expects a 1D grid, 1D block and for there to be exactly one warp for each 16x16 tile in the matrix
 template<typename T> __global__ void wmmaFixedAmountOfThreads(T* a, T* b, T* c, const int N, const int K, const int M) {
@@ -123,11 +119,6 @@ template<typename T> __global__ void wmmaFixedAmountOfThreads(T* a, T* b, T* c, 
     int tileIdX = warpId % (M / TILE_SIZE);
     int tileIdY = warpId / (M / TILE_SIZE);
 
-    /*if (tileIdY >= N) {
-        printf("Error, tileIdY was greater than N");
-        return;
-    }
-    printf("(%d, %d)", tileIdX, tileIdY);*/
     fragment<matrix_a, TILE_SIZE, TILE_SIZE, TILE_SIZE, T, row_major> a_frag;
     fragment<matrix_b, TILE_SIZE, TILE_SIZE, TILE_SIZE, T, row_major> b_frag;
     fragment<accumulator, TILE_SIZE, TILE_SIZE, TILE_SIZE, T> c_frag;
@@ -170,8 +161,7 @@ template<typename T> __global__ void wmmaGridStride(T* a, T* b, T* c, const int 
     }
 }
 
-
-// This function will only take care of the elements that fit neatly into 16x16 tiling.
+// This function will only take care of the elements that fit neatly into 16x16 tiling. Additionally takes "pitch", i.e. padding, of the matrix pointers as arguments.
 template<typename T> __global__ void wmmaGridStrideOnTileableArea(T* a, T* b, T* c, const int N, const int K, const int M, size_t pitch_a, size_t pitch_b, size_t pitch_c) {
     int threadId = threadIdx.x + blockIdx.x * blockDim.x;
     int warpId = threadId / WARP_SIZE;
@@ -198,7 +188,7 @@ template<typename T> __global__ void wmmaGridStrideOnTileableArea(T* a, T* b, T*
     }
 }
 
-
+// Option 1: Go over entire matrix to add results from untileable area.
 template<typename T> __global__ void tilingFix(T* a, T* b, T* c, const int N, const int K, const int M, size_t pitch_a, size_t pitch_b, size_t pitch_c) {
     // Phase 1: iterate over elements that have been taken care of during the tiling matrix matrix multiplication.
     // -> these elements lack the values in the "leftover" parts of the matrix.
@@ -250,6 +240,7 @@ template<typename T> __global__ void tilingFix(T* a, T* b, T* c, const int N, co
 
 }
 
+// Option 2: Go over tileable matrix part and add results from untileable area.
 template<typename T> __global__ void tilingFixMainMatrix(T* a, T* b, T* c, const int N, const int K, const int M, size_t pitch_a, size_t pitch_b, size_t pitch_c) {
     // Phase 1: iterate over elements that have been taken care of during the tiling matrix matrix multiplication.
     // -> these elements lack the values in the "leftover" parts of the matrix.
@@ -267,6 +258,7 @@ template<typename T> __global__ void tilingFixMainMatrix(T* a, T* b, T* c, const
     }
 }
 
+// Option2: Go over untileable matrix part and compute result.
 template<typename T> __global__ void tilingFixLeftovers(T* a, T* b, T* c, const int N, const int K, const int M, size_t pitch_a, size_t pitch_b, size_t pitch_c) {
     // Phase 2: iteratee over elements that are in the leftover area
     // each element has not been computed at all yet
@@ -302,6 +294,8 @@ template<typename T> __global__ void tilingFixLeftovers(T* a, T* b, T* c, const 
     *(T*)((char*)c + y * pitch_c + x * sizeof(T)) = cResult;
 }
 
+//--------------------------------------------------- Setup functions for Kernels ----------------------------------------------------
+//                      Each function sets up the memory for the corresponding kernel, calls it and retrieves the result
 
 template<typename T> void runMatmulSimple(T* h_a, T* h_b, T* h_c, T* result, const int N, const int K, const int M, const int threadsPerBlock, const int blocks) {
     T* h_d = new T[N * M];
@@ -408,14 +402,14 @@ template<typename T> void runWMMATilingFix(T* h_a, T* h_b, T* h_c, T* result, co
 
     dim3 threadsPerBlock3D(threadsPerBlock);
     dim3 blocksPerGrid3D(blocks);
-    // Calculate threads for tilingFix. One thread per leftover element
+    // Calculate threads for tilingFix. One thread per leftover element.
     // Idea: pass multiple of 32 as total number of threads. Some of these wont be used during phase 2, but can be useful for phase 1. Problem: thread divergence
     int leftoverElements = (M % TILE_SIZE) * N + (N % TILE_SIZE) * M - (M % TILE_SIZE) * (N % TILE_SIZE);
     dim3 threadsPerBLock3DTilingFixLeftovers(64);
     dim3 blocksPerGrid3DTilingFixLeftovers(std::max(1, (int)std::ceil((double)leftoverElements / 64.0f)));
 
     dim3 threadsPerBlock3DTilingFixMainMatrix(128);
-    dim3 blocksPerGrid3DTilingFixMainMatrix(std::max(1, (N - N % TILE_SIZE) * (M - M & TILE_SIZE) / 128));
+    dim3 blocksPerGrid3DTilingFixMainMatrix(std::max(1, (N - N % TILE_SIZE) * (M - M & TILE_SIZE) / 128));// This is for option 2, i.e. using two kernels for fixing the matrix output
 
     int priorityLow, priorityHigh;
     CHECK_CUDA(cudaDeviceGetStreamPriorityRange(&priorityLow, &priorityHigh));
@@ -426,10 +420,13 @@ template<typename T> void runWMMATilingFix(T* h_a, T* h_b, T* h_c, T* result, co
 
     nvtxRangePush("TileableFix");
     // Kernel launches
-    wmmaGridStrideOnTileableArea<T> << <blocksPerGrid3D, threadsPerBlock3D, 0, highPriorityStream>> > (d_a, d_b, d_c, N, K, M, pitch_a, pitch_b, pitch_c);
-    tilingFix<T> << <blocksPerGrid3DTilingFixLeftovers, threadsPerBLock3DTilingFixLeftovers, 0, lowPriorityStream >> > (d_a, d_b, d_c, N, K, M, pitch_a, pitch_b, pitch_c);
-    //tilingFixLeftovers<T> << < blocksPerGrid3DTilingFixLeftovers, threadsPerBLock3DTilingFixLeftovers, 0, mediumPriorityStream >> > (d_a, d_b, d_c, N, K, M, pitch_a, pitch_b, pitch_c);
-    //tilingFixMainMatrix<T> << < blocksPerGrid3DTilingFixMainMatrix, threadsPerBlock3DTilingFixMainMatrix, 0, lowPriorityStream >> > (d_a, d_b, d_c, N, K, M, pitch_a, pitch_b, pitch_c);
+    if (leftoverElements == 0) {
+        wmmaGridStrideOnTileableArea<T> << <blocksPerGrid3D, threadsPerBlock3D, 0, highPriorityStream >> > (d_a, d_b, d_c, N, K, M, pitch_a, pitch_b, pitch_c);
+    }
+    else {
+        wmmaGridStrideOnTileableArea<T> << <blocksPerGrid3D, threadsPerBlock3D, 0, highPriorityStream >> > (d_a, d_b, d_c, N, K, M, pitch_a, pitch_b, pitch_c);
+        tilingFix<T> << <blocksPerGrid3DTilingFixLeftovers, threadsPerBLock3DTilingFixLeftovers, 0, lowPriorityStream >> > (d_a, d_b, d_c, N, K, M, pitch_a, pitch_b, pitch_c);
+    }
     nvtxRangePop();
 
     CHECK_CUDA(cudaMemcpy2D(result, M * sizeof(T), d_c, pitch_c, M * sizeof(T), N, cudaMemcpyDeviceToHost));
@@ -439,6 +436,8 @@ template<typename T> void runWMMATilingFix(T* h_a, T* h_b, T* h_c, T* result, co
     CHECK_CUDA(cudaStreamDestroy(lowPriorityStream));
 }
 
+//--------------------------------------------------- Macro functions ---------------------------------------------------------------
+//      Call the setup functions to create test files, get quick data or simply call them to assess them through nsight compute
 void createTestFile() {
     const int dev = 0;
     std::cout << getCUDADeviceInformations(dev).str() << "\n\n";
@@ -659,7 +658,7 @@ void quickDevelopmentData() {
 void nsightComputeRun() {
     const int dev = 0;
     std::cout << getCUDADeviceInformations(dev).str() << "\n\n";
-    int M = 1039, K = 1039, N = 1039;
+    int M = 2049, K = 2049, N = 2049;
     int tileableM = M + (TILE_SIZE - M % TILE_SIZE);
     int tileableK = K + (TILE_SIZE - K % TILE_SIZE);
     int tileableN = N + (TILE_SIZE - N % TILE_SIZE);
